@@ -1,57 +1,46 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import sys
+import os
 from torch.nn.parameter import Parameter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.segment_anything.modeling import Sam
 from models.segment_anything import sam_model_registry
 from models.common.adapter import Adapter, FLRA_Adapter, SW_Adapter
 from models.common.adapter import _adapter_attn, _adapter_mlp
 
-
 class DetailEnhancement(nn.Module):
-    """Edge Guided Refiner — multi-scale edge enhancement decoder.
-
-    Extracts multi-scale edges via parallel depth-wise convolutions (3×3, 5×5, 7×7),
-    then fuses them with upsampled decoder features for refined segmentation.
-    """
-
     def __init__(self, img_dim=64, feature_dim=64, num_classes=6, norm=nn.BatchNorm2d, act=nn.ReLU):
         super().__init__()
         self.num_classes = num_classes
 
-        # Extract local features from input image: Fl = C3x3(I)
         self.img_in_conv = nn.Sequential(
             nn.Conv2d(3, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
-        # Multi-scale depth-wise convolutions (parallel paths, Eq.8)
         self.dconv_3x3 = nn.Conv2d(img_dim, img_dim, 3, padding=1, groups=img_dim, bias=False)
         self.dconv_5x5 = nn.Conv2d(img_dim, img_dim, 5, padding=2, groups=img_dim, bias=False)
         self.dconv_7x7 = nn.Conv2d(img_dim, img_dim, 7, padding=3, groups=img_dim, bias=False)
 
-        # Edge enhancement: C1x1 for each scale (Eq.9)
         self.edge_conv_3x3 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
         self.edge_conv_5x5 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
         self.edge_conv_7x7 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
 
-        # Average pooling for edge extraction
         self.ap = nn.AvgPool2d(3, stride=1, padding=1)
 
-        # Multi-scale edge fusion: F'ee = C3x3(Concat(F1_ee, F2_ee, F3_ee)) (Eq.10)
         self.edge_fusion = nn.Sequential(
             nn.Conv2d(img_dim * 3, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
-        # Channel adjustment for decoder features
         self.channel_adjust = nn.Conv2d(256, feature_dim, 1, bias=False)
 
-        # Decoder feature upsampling: F's = C3x3(UP(C3x3(UP(C3x3(Fs))))) (Eq.7)
         self.feature_upsample = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, 3, padding=1, bias=False),
             norm(feature_dim),
@@ -67,17 +56,14 @@ class DetailEnhancement(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
         )
 
-        # C3x3 applied to F'ee before element-wise addition with Fl (Eq.11)
         self.final_edge_conv = nn.Sequential(
             nn.Conv2d(img_dim, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
-        # MLP: integrated feature has 64 channels, projected by 1x1 conv to N classes (Eq.11)
         self.out_conv = nn.Conv2d(feature_dim + img_dim, num_classes, 1)
 
-        # Handle 768-dimensional features (ViT-H)
         self.feature_proj_768 = nn.Sequential(
             nn.Conv2d(768, 256, 1, bias=False),
             norm(256),
@@ -88,17 +74,9 @@ class DetailEnhancement(nn.Module):
         )
 
     def forward(self, img, decoder_feature):
-        """
-        Args:
-            img: Original input image [B, 3, H, W]
-            decoder_feature: Encoder/decoder feature [B, C, 64, 64]
-        Returns:
-            Se: Enhanced segmentation mask [B, num_classes, H, W]
-        """
         B, C, H_feat, W_feat = decoder_feature.shape
         _, _, H, W = img.shape
 
-        # Handle different channel dimensions
         if C == 768:
             decoder_feature_32 = self.feature_proj_768(decoder_feature)
         elif C == 256:
@@ -110,57 +88,36 @@ class DetailEnhancement(nn.Module):
                 self.dynamic_conv = nn.Conv2d(C, 32, 1, bias=False).to(decoder_feature.device)
             decoder_feature_32 = self.dynamic_conv(decoder_feature)
 
-        # Eq.7: Upsample decoder features to image size
         Fs_up = self.feature_upsample(decoder_feature_32)
         if H != 512 or W != 512:
             Fs_up = F.interpolate(Fs_up, size=(H, W), mode='bilinear', align_corners=False)
 
-        # Eq.8: Extract local features + multi-scale depth-wise convs (parallel)
         Fl = self.img_in_conv(img)
         F1_e = self.dconv_3x3(Fl)
         F2_e = self.dconv_5x5(Fl)
         F3_e = self.dconv_7x7(Fl)
 
-        # Eq.9: Edge enhancement for each scale
         F1_ee = self.edge_conv_3x3(F1_e - self.ap(F1_e)) + F1_e
         F2_ee = self.edge_conv_5x5(F2_e - self.ap(F2_e)) + F2_e
         F3_ee = self.edge_conv_7x7(F3_e - self.ap(F3_e)) + F3_e
 
-        # Eq.10: Multi-scale edge fusion
         F_ee = self.edge_fusion(torch.cat([F1_ee, F2_ee, F3_ee], dim=1))
 
-        # Eq.11: Se = MLP(Concat(F's, Fl + C3x3(F'ee)))
         Se = self.out_conv(torch.cat([Fs_up, Fl + self.final_edge_conv(F_ee)], dim=1))
 
         return Se
 
 
 class FESAM(nn.Module):
-    """FESAM: Frequency-Enhanced SAM with adapter-based fine-tuning.
-
-    Applies frequency-domain adapters to SAM's image encoder and mask decoder
-    for efficient parameter-efficient fine-tuning on downstream segmentation tasks.
-
-    Args:
-        sam_model: a SAM model instance (ViT-based).
-        encoder_attn_adapter: adapter class for encoder attention blocks.
-        decoder_mlp_adapter: adapter class for decoder MLP blocks.
-        decoder_attn_adapter: adapter class for decoder attention blocks.
-        use_mask_decoder_adapter: if True, insert adapters into the mask decoder;
-            otherwise the mask decoder is fully fine-tuned.
-        use_detail_enhancement: if True, enable the DetailEnhancement edge-refiner.
-        num_classes: number of output segmentation classes.
-    """
-
     def __init__(
         self,
         sam_model: Sam,
         encoder_attn_adapter = FLRA_Adapter,
         decoder_mlp_adapter = Adapter,
         decoder_attn_adapter = Adapter,
-        use_mask_decoder_adapter: bool = True,
-        use_detail_enhancement: bool = True,
-        num_classes: int = 6,
+        use_mask_decoder_adapter : bool = True,
+        use_detail_enhancement : bool = True,
+        num_classes : int = 6,
     ):
         super(FESAM, self).__init__()
         self.sam = sam_model
@@ -172,11 +129,11 @@ class FESAM(nn.Module):
         self.num_classes = num_classes
 
         self.encoder_mlp_adapter = SW_Adapter(
-            in_features=768,
-            out_features=768,
-            depth=4,
-            act_layer=nn.GELU,
-            skip_connect=True,
+            in_features = 768,
+            out_features = 768,
+            depth = 4,
+            act_layer = nn.GELU,
+            skip_connect = True,
         )
 
         self.image_encoder_adapters = nn.ModuleList()
@@ -205,6 +162,7 @@ class FESAM(nn.Module):
         )
 
         self._freeze_parameters()
+
         self._adapt_image_encoder()
 
         if self.use_mask_decoder_adapter:
@@ -230,12 +188,13 @@ class FESAM(nn.Module):
             self.image_encoder_adapters.append(adapter_attn)
 
             block.attn.proj = _adapter_attn(
-                block_attn_proj=block.attn.proj,
-                adapter_attn=adapter_attn,
+                block_attn_proj = block.attn.proj,
+                adapter_attn = adapter_attn,
             )
+
             block.mlp = _adapter_mlp(
-                block_mlp=block.mlp,
-                adapter_mlp=self.encoder_mlp_adapter,
+                block_mlp = block.mlp,
+                adapter_mlp = self.encoder_mlp_adapter,
             )
 
     def _adapt_mask_decoder_twab(self):
@@ -257,20 +216,20 @@ class FESAM(nn.Module):
             self.mask_decoder_adapters.append(adapter_mlp)
 
             block.self_attn.out_proj = _adapter_attn(
-                block_attn_proj=block.self_attn.out_proj,
-                adapter_attn=adapter_self_attn,
+                block_attn_proj = block.self_attn.out_proj,
+                adapter_attn = adapter_self_attn,
             )
             block.cross_attn_token_to_image.out_proj = _adapter_attn(
-                block_attn_proj=block.cross_attn_token_to_image.out_proj,
-                adapter_attn=adapter_cross_attn_token_to_image,
+                block_attn_proj = block.cross_attn_token_to_image.out_proj,
+                adapter_attn = adapter_cross_attn_token_to_image,
             )
             block.cross_attn_image_to_token.out_proj = _adapter_attn(
-                block_attn_proj=block.cross_attn_image_to_token.out_proj,
-                adapter_attn=adapter_cross_attn_image_to_token,
+                block_attn_proj = block.cross_attn_image_to_token.out_proj,
+                adapter_attn = adapter_cross_attn_image_to_token,
             )
             block.mlp = _adapter_mlp(
-                block_mlp=block.mlp,
-                adapter_mlp=adapter_mlp,
+                block_mlp = block.mlp,
+                adapter_mlp = adapter_mlp,
             )
 
     def _adapt_mask_decoder_fab(self):
@@ -279,8 +238,8 @@ class FESAM(nn.Module):
 
         self.final_attn_adapter = self.decoder_attn_adapter(final_attn_dim, final_attn_dim)
         final_attn.out_proj = _adapter_attn(
-            block_attn_proj=final_attn.out_proj,
-            adapter_attn=self.final_attn_adapter,
+            block_attn_proj = final_attn.out_proj,
+            adapter_attn = self.final_attn_adapter,
         )
 
     def print_model_parameters_info(self, print_more_info=False):
@@ -371,7 +330,6 @@ class FESAM(nn.Module):
             prompt_encoder_values = [state_dict[k] for k in prompt_encoder_keys]
             prompt_encoder_new_state_dict = dict(zip(prompt_encoder_keys, prompt_encoder_values))
             sam_dict.update(prompt_encoder_new_state_dict)
-
             mask_decoder_keys = [k for k in sam_keys if 'mask_decoder' in k]
             mask_decoder_values = [state_dict[k] for k in mask_decoder_keys]
             mask_decoder_new_state_dict = dict(zip(mask_decoder_keys, mask_decoder_values))
@@ -410,7 +368,9 @@ class FESAM(nn.Module):
                 image_embeddings = image_embeddings[0]
 
             sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
-                points=None, boxes=None, masks=None,
+                points=None,
+                boxes=None,
+                masks=None,
             )
 
             low_res_masks, iou_predictions = self.sam.mask_decoder(
@@ -446,9 +406,10 @@ class FESAM(nn.Module):
                 "iou_predictions": iou_predictions,
                 "low_res_logits": low_res_masks,
             }
-
             return outputs, image_embeddings
         else:
             if isinstance(batched_input, torch.Tensor):
                 batched_input = [{"image": batched_input[i], "original_size": (image_size, image_size)} for i in range(batched_input.shape[0])]
             return self.sam(batched_input, multimask_output, image_size), None
+
+
