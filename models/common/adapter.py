@@ -144,7 +144,7 @@ class FLRA_Adapter(nn.Module):
         high_pass_mask = 1 - low_pass_mask
         return low_pass_mask.unsqueeze(0).unsqueeze(-1), high_pass_mask.unsqueeze(0).unsqueeze(-1)
 
-    def adaptive_cutoff_freq(self, magnitude_spectrum, energy_percentage=0.1):
+    def adaptive_cutoff_freq(self, magnitude_spectrum, energy_percentage=0.3):
         total_energy = torch.sum(magnitude_spectrum)
         energy_sum = 0
         h, w = magnitude_spectrum.shape[-2:]
