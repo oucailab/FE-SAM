@@ -21,30 +21,37 @@ class DetailEnhancement(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
+        # Extract local features from input image: Fl = C3x3(I)
         self.img_in_conv = nn.Sequential(
             nn.Conv2d(3, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
+        # Multi-scale depth-wise convolutions (parallel paths, Eq.8)
         self.dconv_3x3 = nn.Conv2d(img_dim, img_dim, 3, padding=1, groups=img_dim, bias=False)
         self.dconv_5x5 = nn.Conv2d(img_dim, img_dim, 5, padding=2, groups=img_dim, bias=False)
         self.dconv_7x7 = nn.Conv2d(img_dim, img_dim, 7, padding=3, groups=img_dim, bias=False)
 
+        # Edge enhancement: C1x1 for each scale (Eq.9)
         self.edge_conv_3x3 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
         self.edge_conv_5x5 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
         self.edge_conv_7x7 = nn.Conv2d(img_dim, img_dim, 1, bias=False)
 
+        # Average pooling for edge extraction
         self.ap = nn.AvgPool2d(3, stride=1, padding=1)
 
+        # Multi-scale edge fusion: F'ee = C3x3(Concat(F1_ee, F2_ee, F3_ee)) (Eq.10)
         self.edge_fusion = nn.Sequential(
             nn.Conv2d(img_dim * 3, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
+        # Channel adjustment for decoder features
         self.channel_adjust = nn.Conv2d(256, feature_dim, 1, bias=False)
 
+        # Decoder feature upsampling: F's = C3x3(UP(C3x3(UP(C3x3(Fs))))) (Eq.7)
         self.feature_upsample = nn.Sequential(
             nn.Conv2d(feature_dim, feature_dim, 3, padding=1, bias=False),
             norm(feature_dim),
@@ -60,14 +67,17 @@ class DetailEnhancement(nn.Module):
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
         )
 
+        # C3x3 applied to F'ee before element-wise addition with Fl (Eq.11)
         self.final_edge_conv = nn.Sequential(
             nn.Conv2d(img_dim, img_dim, 3, padding=1, bias=False),
             norm(img_dim),
             act()
         )
 
+        # MLP: integrated feature has 64 channels, projected by 1x1 conv to N classes (Eq.11)
         self.out_conv = nn.Conv2d(feature_dim + img_dim, num_classes, 1)
 
+        # Handle 768-dimensional features (ViT-H)
         self.feature_proj_768 = nn.Sequential(
             nn.Conv2d(768, 256, 1, bias=False),
             norm(256),
@@ -83,11 +93,12 @@ class DetailEnhancement(nn.Module):
             img: Original input image [B, 3, H, W]
             decoder_feature: Encoder/decoder feature [B, C, 64, 64]
         Returns:
-            Enhanced segmentation mask [B, num_classes, H, W]
+            Se: Enhanced segmentation mask [B, num_classes, H, W]
         """
         B, C, H_feat, W_feat = decoder_feature.shape
         _, _, H, W = img.shape
 
+        # Handle different channel dimensions
         if C == 768:
             decoder_feature_32 = self.feature_proj_768(decoder_feature)
         elif C == 256:
@@ -99,21 +110,26 @@ class DetailEnhancement(nn.Module):
                 self.dynamic_conv = nn.Conv2d(C, 32, 1, bias=False).to(decoder_feature.device)
             decoder_feature_32 = self.dynamic_conv(decoder_feature)
 
+        # Eq.7: Upsample decoder features to image size
         Fs_up = self.feature_upsample(decoder_feature_32)
         if H != 512 or W != 512:
             Fs_up = F.interpolate(Fs_up, size=(H, W), mode='bilinear', align_corners=False)
 
+        # Eq.8: Extract local features + multi-scale depth-wise convs (parallel)
         Fl = self.img_in_conv(img)
         F1_e = self.dconv_3x3(Fl)
         F2_e = self.dconv_5x5(Fl)
         F3_e = self.dconv_7x7(Fl)
 
+        # Eq.9: Edge enhancement for each scale
         F1_ee = self.edge_conv_3x3(F1_e - self.ap(F1_e)) + F1_e
         F2_ee = self.edge_conv_5x5(F2_e - self.ap(F2_e)) + F2_e
         F3_ee = self.edge_conv_7x7(F3_e - self.ap(F3_e)) + F3_e
 
+        # Eq.10: Multi-scale edge fusion
         F_ee = self.edge_fusion(torch.cat([F1_ee, F2_ee, F3_ee], dim=1))
 
+        # Eq.11: Se = MLP(Concat(F's, Fl + C3x3(F'ee)))
         Se = self.out_conv(torch.cat([Fs_up, Fl + self.final_edge_conv(F_ee)], dim=1))
 
         return Se
