@@ -181,8 +181,6 @@ python adapter_loveda_test.py \
 - `--batch-size`: Inference batch size (default: 1)
 - `--save-logits`: Save raw logits for ensemble methods
 
-- https://your-lab-website.com)
-
 ---
 
 <div align="center">
