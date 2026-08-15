@@ -9,7 +9,7 @@
 ## 🏗️ Architecture Overview
 
 <div align="center">
-  <img src="assets/architecture.png" alt="FE-SAM Architecture" width="800"/>
+  <img src="https://gaopursuit.oss-cn-beijing.aliyuncs.com/img/2026/ScreenShot_2026-08-16_063700_466.jpg" alt="FE-SAM Architecture" width="800"/>
 </div>
 
 
