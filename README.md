@@ -1,4 +1,4 @@
-# FE-SAM: Learning Frequency-Adapted Segment Anything Model for Remote Sensing Image Semantic Segmentation, IEEE TGRS 2026
+# Frequency and Edge-Guided Segment Anything Model for Remote Sensing Image Semantic Segmentation, IEEE TGRS 2026
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.9+-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/get-started/locally/)
 
